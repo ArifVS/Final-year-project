@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Result</title>
+    <style>
+        body { font-family: Arial; text-align: center; background: #f7f9fc; padding: 30px; }
+        img { width: 60%; border-radius: 12px; border: 2px solid #007bff; margin-top: 20px; }
+        .info { font-size: 18px; margin-top: 20px; }
+        a { color: #007bff; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <h1>🚘 Processed Results</h1>
+    <p class="info">Detected Vehicles: <b>{{ count }}</b></p>
+    <p class="info">Optimized Green Signal Time: <b>{{ signal_time }} seconds</b></p>
+    <img src="{{ url_for('static', filename='outputs/' + file_processed) }}" alt="Processed Output">
+    <br><br>
+    <a href="/">⬅ Go Back</a>
+</body>
+</html>

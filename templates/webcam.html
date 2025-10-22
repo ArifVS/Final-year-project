@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Live Traffic Feed</title>
+    <style>
+        body { font-family: Arial; text-align: center; background: #f0f0f0; }
+        h1 { color: #222; }
+        .video-box { margin-top: 20px; border: 3px solid #007bff; border-radius: 10px; display: inline-block; }
+        img { width: 80%; border-radius: 10px; }
+        a { display: block; margin-top: 20px; color: #007bff; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <h1>🎥 Real-Time AI Traffic Detection</h1>
+    <div class="video-box">
+        <img src="{{ url_for('video_feed') }}" alt="Webcam Feed">
+    </div>
+    <a href="/">⬅ Back to Home</a>
+</body>
+</html>
