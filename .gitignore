@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.mp4
+*.csv
+static/uploads/
+static/outputs/
