@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Traffic Management System</title>
+    <style>
+        body { font-family: Arial; text-align: center; background: #f5f6fa; padding: 30px; }
+        h1 { color: #333; }
+        .card { background: white; padding: 25px; border-radius: 12px; width: 50%; margin: 0 auto; box-shadow: 0 0 10px #ccc; }
+        input { margin: 15px; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; }
+        a { display: inline-block; margin-top: 20px; color: #007bff; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <h1>🚦 AI-Based Traffic Control</h1>
+    <div class="card">
+        <form action="/process" method="POST" enctype="multipart/form-data">
+            <h3>Upload Traffic Image or Video</h3>
+            <input type="file" name="file" accept="image/*,video/*" required><br>
+            <button type="submit">Upload & Analyze</button>
+        </form>
+        <hr>
+        <a href="{{ url_for('webcam') }}">🎥 View Real-Time Webcam Detection</a>
+    </div>
+</body>
+</html>
