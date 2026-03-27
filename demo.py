@@ -1,337 +1,233 @@
-# edge_federated_traffic.py
-"""
-Edge-Based Federated Learning for Real-Time Traffic Prediction
-Supports image, video and webcam inputs. Uses YOLOv8 (ultralytics) for detection,
-Keras LSTM for lightweight prediction on each edge, and federated averaging
-(across Keras model weights) every aggregation_interval seconds.
-Saves per-intersection CSVs with vehicle counts.
-"""
-
-import os
+from flask import Flask, render_template, request, redirect, url_for, Response
 import cv2
-import time
-import threading
 import numpy as np
+import os
 import pandas as pd
 from ultralytics import YOLO
-from tensorflow.keras.models import Sequential, clone_model
+from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import backend as K
+import time
 
-# ---------------------------
-# Configuration
-# ---------------------------
-vehicle_classes = {'car', 'motorbike', 'bus', 'truck', 'auto'}  # names expected from YOLO
-time_window = 10               # LSTM input window (timesteps)
-lstm_epochs_per_train = 3      # local training epochs (kept small for demo)
-aggregation_interval = 30      # seconds between federated aggregation
-model_path_yolo = "yolov8n.pt" # ensure this exists or change to available model
-CONF_THRESHOLD = 0.25          # detection confidence threshold
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['OUTPUT_FOLDER'] = 'static/outputs'
 
-# Load YOLO once
-model_yolo = YOLO(model_path_yolo)
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
-# ---------------------------
-# LSTM Model factory
-# ---------------------------
-def create_lstm_model(input_shape=(time_window, 1)):
+# ---------------------- YOLO (UNCHANGED) ----------------------
+model_yolo = YOLO("yolov8m.pt")
+
+vehicle_classes = ['car','motorcycle','bus','truck','bicycle']
+
+# ---------------------- FEDERATED SETUP ----------------------
+EDGE_NODES = 3
+history_files = [f"traffic_node_{i}.csv" for i in range(EDGE_NODES)]
+
+time_window = 5
+lstm_epochs = 3
+
+def create_lstm_model():
     model = Sequential([
-        LSTM(32, input_shape=input_shape, activation='tanh'),
-        Dense(1, activation='linear')
+        LSTM(32, input_shape=(time_window, 1), activation='relu'),
+        Dense(1)
     ])
-    model.compile(optimizer=Adam(0.005), loss='mse')
+    model.compile(optimizer=Adam(0.01), loss='mse')
     return model
 
-# ---------------------------
-# Vehicle Detection (with boxes)
-# ---------------------------
+global_model = create_lstm_model()
+
+# ---------------------- DETECTION (DO NOT TOUCH) ----------------------
 def detect_vehicles(frame):
-    """
-    Uses ultralytics YOLO model to detect objects in a single BGR frame (numpy array).
-    Returns (vehicle_count, annotated_frame).
-    """
-    # Ultralytics expects BGR or RGB depending; passing numpy array is supported
-    results = model_yolo.predict(frame, verbose=False)  # returns Results object list
+    results = model_yolo.predict(frame, conf=0.15, iou=0.45, imgsz=1280, verbose=False)
+
     count = 0
-    annotated = frame.copy()
-    if len(results) == 0:
-        return 0, annotated
+    for r in results:
+        for box in r.boxes:
+            cls = int(box.cls[0])
+            name = model_yolo.names[cls]
 
-    r = results[0]  # for a single frame
-    boxes = getattr(r, "boxes", None)
-    if boxes is None:
-        return 0, annotated
+            if name in vehicle_classes:
+                count += 1
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, name, (x1, y1-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
-    # boxes.xyxy, boxes.conf, boxes.cls are available as tensors/arrays
-    xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else np.array(boxes.xyxy)
-    confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else np.array(boxes.conf)
-    cls_ids = boxes.cls.cpu().numpy().astype(int) if hasattr(boxes.cls, "cpu") else np.array(boxes.cls).astype(int)
+    return count, frame
 
-    for (x1, y1, x2, y2), conf, cls in zip(xyxy, confs, cls_ids):
-        if conf < CONF_THRESHOLD:
-            continue
-        name = r.names.get(int(cls), str(cls))
-        if name in vehicle_classes:
-            count += 1
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(annotated, f"{name} {conf:.2f}", (x1, max(15, y1-5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-    return count, annotated
+# ---------------------- UPDATE HISTORY ----------------------
+def update_history(node_id, count):
+    file = history_files[node_id]
 
-# ---------------------------
-# Edge Intersection
-# ---------------------------
-class EdgeIntersection:
-    def __init__(self, name, input_type, source):
-        """
-        input_type: 1=image, 2=video, 3=webcam
-        source: path or webcam index (string or int)
-        """
-        self.name = name
-        self.input_type = input_type
-        self.source = source
-        self.lstm_model = create_lstm_model()
-        self.vehicle_history_full = []   # keep full history for training
-        self.recent_window = []          # keep recent window for prediction (max time_window*4)
-        self.local_data = []             # for CSV save
-        self.lock = threading.Lock()
-        self.running = True
+    if os.path.exists(file):
+        df = pd.read_csv(file)
+    else:
+        df = pd.DataFrame(columns=['Vehicle_Count'])
 
-        # set up capture or image
-        if self.input_type == 1:
-            if not os.path.exists(source):
-                raise FileNotFoundError(f"Image not found: {source}")
-            self.single_frame = cv2.imread(source)
-            self.cap = None
-        else:
-            # video path or webcam index
-            try:
-                idx = int(source)
-                self.cap = cv2.VideoCapture(idx)
-            except Exception:
-                self.cap = cv2.VideoCapture(source)
+    df = pd.concat([df, pd.DataFrame({'Vehicle_Count':[count]})], ignore_index=True)
+    df.to_csv(file, index=False)
 
-        # background training thread control
-        self._train_thread = None
+# ---------------------- LOCAL TRAIN ----------------------
+def train_local_model(node_id):
+    file = history_files[node_id]
 
-    def start(self):
-        # start video/image processing in current thread (or separately if you want)
-        if self.input_type == 1:
-            self.process_frame_loop(single=True)
-        else:
-            self.process_frame_loop(single=False)
+    if not os.path.exists(file):
+        return None
 
-    def stop(self):
-        self.running = False
-        if self.cap:
-            try:
-                self.cap.release()
-            except:
-                pass
-        # wait for trainer thread
-        if self._train_thread and self._train_thread.is_alive():
-            self._train_thread.join(timeout=2)
+    df = pd.read_csv(file)
+    values = df['Vehicle_Count'].values
 
-    def process_frame_loop(self, single=False):
-        if single:
-            self.process_frame(self.single_frame)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-            self.save_data()
-            return
+    if len(values) < time_window + 1:
+        return None
 
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                # video finished or webcam disconnected
-                break
-            self.process_frame(frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                # stop if user presses 'q'
-                self.running = False
-                break
-        if self.cap:
-            self.cap.release()
-        cv2.destroyAllWindows()
-        self.save_data()
+    X, y = [], []
+    for i in range(len(values) - time_window):
+        X.append(values[i:i+time_window])
+        y.append(values[i+time_window])
 
-    def process_frame(self, frame):
-        # detect vehicles and annotate
-        vehicle_count, annotated = detect_vehicles(frame)
+    X = np.array(X).reshape(-1, time_window, 1)
+    y = np.array(y)
 
-        # update histories
-        with self.lock:
-            self.vehicle_history_full.append(vehicle_count)
-            self.recent_window.append(vehicle_count)
-            self.local_data.append(vehicle_count)
-            # keep recent window bounded (avoid unlimited growth)
-            if len(self.recent_window) > max(time_window * 8, 200):
-                self.recent_window.pop(0)
+    model = create_lstm_model()
+    model.fit(X, y, epochs=lstm_epochs, verbose=0)
 
-        # start training in background if enough samples
-        if len(self.vehicle_history_full) >= time_window + 1:
-            if not (self._train_thread and self._train_thread.is_alive()):
-                self._train_thread = threading.Thread(target=self.train_local_model, daemon=True)
-                self._train_thread.start()
+    return model.get_weights()
 
-        # predict next value using LSTM (if possible)
-        pred = self.predict_traffic()
+# ---------------------- FEDERATED AVERAGING ----------------------
+def federated_averaging(weights_list):
+    avg_weights = []
+    for weights in zip(*weights_list):
+        avg_weights.append(np.mean(weights, axis=0))
+    return avg_weights
 
-        # compute signal time based on current real-time vehicle_count and predicted value
-        signal_time = self.calculate_signal_time(vehicle_count, predicted_next=pred)
+# ---------------------- PREDICT ----------------------
+def predict_traffic(node_id=0):
+    local_weights = []
 
-        # overlay info and show
-        cv2.putText(annotated,
-                    f"{self.name} Cur={vehicle_count} Pred={pred} Sig={signal_time}s",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        cv2.imshow(self.name, annotated)
+    for i in range(EDGE_NODES):
+        w = train_local_model(i)
+        if w is not None:
+            local_weights.append(w)
 
-    def train_local_model(self):
-        """
-        Build dataset from vehicle_history_full and train LSTM.
-        We form sliding windows of length `time_window` -> next value.
-        """
-        with self.lock:
-            series = list(self.vehicle_history_full)  # copy
+    # fallback
+    if not local_weights:
+        file = history_files[node_id]
+        if os.path.exists(file):
+            df = pd.read_csv(file)
+            if len(df) > 0:
+                return calculate_signal_time(df['Vehicle_Count'].values[-1])
+        return 10
 
-        # create windows
-        X, y = [], []
-        for i in range(len(series) - time_window):
-            X.append(series[i:i+time_window])
-            y.append(series[i+time_window])
-        if len(X) == 0:
-            return
+    # federated learning
+    avg_weights = federated_averaging(local_weights)
+    global_model.set_weights(avg_weights)
 
-        X = np.array(X, dtype=np.float32).reshape(-1, time_window, 1)
-        y = np.array(y, dtype=np.float32).reshape(-1, 1)
+    df = pd.read_csv(history_files[node_id])
+    values = df['Vehicle_Count'].values
 
-        # tiny training for demo
-        try:
-            self.lstm_model.fit(X, y, epochs=lstm_epochs_per_train, verbose=0)
-            print(f"[{self.name}] Trained locally on {len(X)} samples.")
-        except Exception as e:
-            print(f"[{self.name}] Training error: {e}")
+    if len(values) < time_window:
+        return calculate_signal_time(values[-1])
 
-    def predict_traffic(self):
-        with self.lock:
-            if len(self.recent_window) < time_window:
-                return int(self.recent_window[-1]) if self.recent_window else 0
-            inp = np.array(self.recent_window[-time_window:], dtype=np.float32).reshape(1, time_window, 1)
+    data = values[-time_window:].reshape(1, time_window, 1)
 
-        try:
-            p = self.lstm_model.predict(inp, verbose=0)
-            return int(max(0, round(float(p[0][0]))))
-        except Exception:
-            return int(self.recent_window[-1])
+    pred = int(global_model.predict(data, verbose=0)[0][0])
+    pred = max(pred, 1)
 
-    def calculate_signal_time(self, vehicle_count, predicted_next=None):
-        """
-        Rule-based mapping. You can replace with RL later.
-        Here we combine current count and prediction a bit for smoother behavior.
-        """
-        if predicted_next is None:
-            predicted_next = vehicle_count
-        combined = 0.6 * vehicle_count + 0.4 * predicted_next
+    current = values[-1]
 
-        if combined <= 5:
-            return 10
-        elif combined <= 10:
-            return 20
-        elif combined <= 20:
-            return 30
-        elif combined <= 30:
-            return 40
-        else:
-            return 50
+    final_count = int(0.6 * current + 0.4 * pred)
 
-    def save_data(self):
-        # save local_data to CSV
-        if len(self.local_data) == 0:
-            return
-        df = pd.DataFrame({'Vehicle_Count': self.local_data})
-        fname = f"{self.name}_traffic.csv"
-        df.to_csv(fname, index=False)
-        print(f"✅ {self.name} data saved -> {fname}")
+    return calculate_signal_time(final_count)
 
-# ---------------------------
-# Federated Aggregation
-# ---------------------------
-def federated_aggregate(models):
-    """
-    models: list of Keras model instances (same architecture).
-    Perform simple average of weights (FedAvg).
-    """
-    if not models:
-        return
-    # collect weight lists
-    weights_list = [m.get_weights() for m in models]
-    # average each weight tensor across models
-    new_weights = []
-    for weights_tuple in zip(*weights_list):
-        new_weights.append(np.mean(np.array(weights_tuple), axis=0))
-    # set averaged weights to each model
-    for m in models:
-        m.set_weights(new_weights)
-    print("⚡ Federated aggregation completed.")
+# ---------------------- SIGNAL ----------------------
+def calculate_signal_time(count):
+    if count <= 10:
+        return 10
+    elif count <= 20:
+        return 20
+    elif count <= 30:
+        return 30
+    elif count <= 40:
+        return 40
+    else:
+        return 50
 
-# ---------------------------
-# Main orchestration
-# ---------------------------
-def main():
-    intersections = []
-    try:
-        num = int(input("Enter number of intersections: ").strip())
-    except Exception:
-        print("Invalid number, using 1 intersection.")
-        num = 1
+# ---------------------- ROUTES ----------------------
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-    for i in range(num):
-        print(f"\nIntersection {i+1}: Choose input type:\n1. Image\n2. Video\n3. Webcam")
-        try:
-            input_type = int(input("Enter 1, 2, or 3: ").strip())
-        except Exception:
-            input_type = 3
-        if input_type == 1:
-            source = input("Enter image path: ").strip()
-        else:
-            source = input("Enter video path or webcam index (0 for default): ").strip()
-        ei = EdgeIntersection(f"Edge-{i+1}", input_type, source)
-        intersections.append(ei)
+@app.route('/process', methods=['POST'])
+def process():
+    file = request.files['file']
+    if not file:
+        return redirect(url_for('index'))
 
-    # start each intersection in its own thread
-    threads = []
-    for inter in intersections:
-        t = threading.Thread(target=inter.start, daemon=True)
-        t.start()
-        threads.append(t)
+    filename = file.filename
+    upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], f"processed_{filename}")
 
-    # federated server thread
-    def federated_server():
-        while True:
-            time.sleep(aggregation_interval)
-            print(">>> Aggregation triggered...")
-            # clone model architecture for safe averaging (use copies if needed)
-            models = [inter.lstm_model for inter in intersections if inter is not None]
-            try:
-                federated_aggregate(models)
-            except Exception as e:
-                print("Aggregation error:", e)
+    file.save(upload_path)
 
-    agg_thread = threading.Thread(target=federated_server, daemon=True)
-    agg_thread.start()
+    frame = cv2.imread(upload_path)
+    count, processed_frame = detect_vehicles(frame)
 
-    try:
-        # join on UI threads (they are daemonic; allow Ctrl+C to stop)
-        while any(t.is_alive() for t in threads):
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Stopping...")
-    finally:
-        for inter in intersections:
-            inter.stop()
-        print("All stopped.")
+    cv2.imwrite(output_path, processed_frame)
 
+    node_id = 0
+    update_history(node_id, count)
+
+    signal_time = predict_traffic(node_id)
+
+    return render_template('result.html',
+                           count=count,
+                           signal_time=signal_time,
+                           file_processed=f"processed_{filename}")
+
+# ---------------------- WEBCAM ----------------------
+def gen_frames():
+    cap = cv2.VideoCapture(0)
+
+    last_update = time.time()
+    current_signal = 10
+
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+
+        count, processed_frame = detect_vehicles(frame)
+
+        node_id = np.random.randint(0, EDGE_NODES)
+        update_history(node_id, count)
+
+        if time.time() - last_update > 3:
+            current_signal = predict_traffic(node_id)
+            last_update = time.time()
+
+        cv2.putText(processed_frame, f"Vehicles: {count}", (20,40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+
+        cv2.putText(processed_frame, f"Signal: {current_signal}s", (20,80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+
+        ret, buffer = cv2.imencode('.jpg', processed_frame)
+        frame_bytes = buffer.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+@app.route('/webcam')
+def webcam():
+    return render_template('webcam.html')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# ---------------------- RUN ----------------------
 if __name__ == "__main__":
-    main()
+    app.run(debug=True)
