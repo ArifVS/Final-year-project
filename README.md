@@ -1,3 +1,13 @@
+## 📊 Project Details
+
+| PB No | Title of the Project | Problem Statement | Abstract | Domain |
+|------|---------------------|------------------|----------|--------|
+| PB-NO-188 | Edge-Based Federated Learning for Real-Time Traffic Prediction in Smart Cities | Centralized machine learning models for urban traffic prediction often require huge amounts of data to be collected and processed in cloud servers, raising concerns about data privacy, latency, and network bandwidth usage. | This project implements a federated learning framework that performs traffic flow prediction on edge devices deployed at various traffic intersections in a smart city environment. Instead of sending raw video or sensor data to the cloud, each device locally trains a lightweight LSTM or CNN model using real-time traffic data. The local models share only their updated parameters with a central server, which aggregates them to create a global model without compromising data privacy. The system predicts congestion trends, optimizes traffic signal timing, and minimizes latency in real-time decision-making. This privacy-preserving, scalable approach represents the next generation of intelligent urban infrastructure. | Federated Learning, Edge Computing, Smart Cities, Artificial Intelligence |
+
+
+
+
+
 [README.md](https://github.com/user-attachments/files/26377634/README.md)
 # 🚦 Smart Traffic Management System
 ### Federated Learning + YOLOv8 + LSTM | Final Year Project
