@@ -3,3 +3,4 @@ opencv-python-headless   # or opencv-python if you want GUI
 tensorflow>=2.11
 pandas
 numpy
+flask
